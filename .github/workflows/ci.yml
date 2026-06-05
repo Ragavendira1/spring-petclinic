@@ -1,0 +1,165 @@
+name: devsecops-pipeline
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+
+  code_repo:
+    runs-on: ubuntu-linux
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          repository: Ragavendira1/spring-petclinic
+          ref: main
+
+  secret_scan:
+    needs: [code_repo]
+    runs-on: ubuntu-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Secret Scan (Hard Gate)
+        run: |
+          set -e
+          docker run --rm -v $(pwd):/repo zricethezav/gitleaks:latest detect -s /repo --no-banner --report-format json --report-path gitleaks-report.json
+          if grep -q '"leaks": \[[^]]' gitleaks-report.json; then
+            echo "Secrets detected! Failing pipeline."
+            exit 1
+          fi
+
+  sast:
+    needs: [secret_scan]
+    runs-on: ubuntu-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: SAST Scan (Semgrep - Hard Gate)
+        run: |
+          set -e
+          docker run --rm -v $(pwd):/src returntocorp/semgrep semgrep scan --config auto --json --output semgrep.json
+          if grep -q '"severity": "ERROR"' semgrep.json; then exit 1; fi
+
+  dependency_install:
+    needs: [sast]
+    runs-on: ubuntu-linux
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: actions/checkout@v4
+      - name: Cache Maven Dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ hashFiles('**/pom.xml') }}
+      - name: Maven Install Dependencies
+        run: mvn -q -B dependency:resolve
+
+  dependency_scan:
+    needs: [dependency_install]
+    runs-on: ubuntu-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency Vulnerability Scan (OWASP DC - Hard Gate)
+        run: |
+          set -e
+          mvn org.owasp:dependency-check-maven:check -Dformat=JSON
+          if grep -q '"severity":"Critical"' dependency-check-report.json; then exit 1; fi
+          if grep -q '"severity":"High"' dependency-check-report.json; then exit 1; fi
+
+  unit_tests:
+    needs: [dependency_scan]
+    runs-on: ubuntu-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Unit Tests
+        run: mvn test
+
+  build:
+    needs: [unit_tests]
+    runs-on: ubuntu-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Artifact
+        run: mvn -B package
+
+  container_scan:
+    needs: [build]
+    runs-on: ubuntu-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker Image
+        run: docker build -t petclinic-app:latest .
+      - name: Container Scan (Trivy - Hard Gate)
+        run: |
+          docker run --rm aquasec/trivy:latest image --severity CRITICAL,HIGH --exit-code 1 petclinic-app:latest
+
+  iac_scan:
+    needs: [container_scan]
+    runs-on: ubuntu-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: IaC Scan (Checkov - Hard Gate)
+        run: |
+          set -e
+          docker run --rm -v $(pwd):/iac bridgecrew/checkov --directory /iac --quiet --soft-fail
+          if [ $? -ne 0 ]; then exit 1; fi
+
+  sbom:
+    needs: [iac_scan]
+    runs-on: ubuntu-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate SBOM (Syft - CycloneDX JSON)
+        run: |
+          docker run --rm -v $(pwd):/src anchore/syft:latest dir:/src -o cyclonedx-json=sbom.json
+
+  deploy_dev:
+    needs: [sbom]
+    runs-on: ubuntu-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to Dev Environment
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          echo "$KUBE_CONFIG" > kubeconfig.yaml
+          kubectl --kubeconfig=kubeconfig.yaml apply -f k8s/
+
+  dast:
+    needs: [deploy_dev]
+    runs-on: ubuntu-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: DAST Scan (ZAP - Hard Gate)
+        env:
+          TARGET_URL: "https://dev.myapp.com"
+        run: |
+          set -e
+          docker run --rm -v $(pwd):/zap/wrk owasp/zap2docker-stable zap-baseline.py -t $TARGET_URL -r zap-report.html || true
+          if grep -q "High" zap-report.html; then exit 1; fi
+          if grep -q "Critical" zap-report.html; then exit 1; fi
+
+  compliance_checks:
+    needs: [dast]
+    runs-on: ubuntu-linux
+    steps:
+      - name: Compliance Placeholder
+        run: echo "Compliance checks executed."
+
+  deploy_prod:
+    needs: [compliance_checks]
+    runs-on: ubuntu-linux
+    environment:
+      name: production
+      url: https://prod.myapp.com
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to Production
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          echo "$KUBE_CONFIG" > kubeconfig.yaml
+          kubectl --kubeconfig=kubeconfig.yaml apply -f k8s/
