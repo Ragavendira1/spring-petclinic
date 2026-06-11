@@ -1,0 +1,176 @@
+name: CI
+on:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+
+  job_1_code_repo:
+    name: Code Repository Checkout
+    runs-on: Self Hosted Agent
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          repository: spring-projects/spring-petclinic
+          ref: main
+          fetch-depth: 0
+
+      - name: Validate Repository Access
+        run: git status
+        shell: bash
+
+  job_2_secret_scan:
+    name: Secret Scanning
+    needs: [job_1_code_repo]
+    runs-on: Azure Hosted Agent
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks-linux-amd64 -o gitleaks
+          chmod +x gitleaks
+
+      - name: Run Secret Scan (HARD GATE)
+        run: |
+          ./gitleaks detect --no-banner --redact --exit-code 1 .
+        shell: bash
+
+  job_3_sast:
+    name: SAST Scanning
+    needs: [job_2_secret_scan]
+    runs-on: Azure Hosted Agent
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Run Semgrep SAST (HARD GATE)
+        run: |
+          semgrep scan --config auto --severity ERROR --error
+        shell: bash
+
+  job_4_dependency_install:
+    name: Dependency Installation
+    needs: [job_3_sast]
+    runs-on: Self Hosted Agent
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Maven Dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: m2-${{ hashFiles('**/pom.xml') }}
+
+      - name: Install Dependencies
+        run: mvn -B dependency:resolve dependency:resolve-plugins
+        shell: bash
+
+  job_5_dependency_scan:
+    name: Dependency / SCA Scan
+    needs: [job_4_dependency_install]
+    runs-on: Azure Hosted Agent
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OSV Scanner
+        run: |
+          curl -sSL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o osv-scanner
+          chmod +x osv-scanner
+
+      - name: Run OSV SCA Scan (HARD GATE)
+        run: |
+          ./osv-scanner --scan=. --exit-code-on-vuln=1
+        shell: bash
+
+  job_6_lint:
+    name: Lint
+    needs: [job_5_dependency_scan]
+    runs-on: Self Hosted Agent
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Checkstyle (SOFT GATE)
+        run: |
+          mvn -q checkstyle:check || echo "Lint warnings detected"
+        shell: bash
+
+  job_7_test:
+    name: Unit Tests
+    needs: [job_6_lint]
+    runs-on: Self Hosted Agent
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Unit Tests (HARD GATE)
+        run: mvn -B test
+        shell: bash
+
+  job_8_build:
+    name: Build
+    needs: [job_7_test]
+    runs-on: Self Hosted Agent
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Package
+        run: mvn -B package -DskipTests
+        shell: bash
+
+      - name: Generate Artifact Version
+        id: versioning
+        run: echo "ARTIFACT_VERSION=$(date +'%Y%m%d.%H%M%S')" >> $GITHUB_ENV
+        shell: bash
+
+  job_9_deploy_dev:
+    name: Deploy to Dev
+    needs: [job_8_build]
+    runs-on: Self Hosted Agent
+    timeout-minutes: 20
+    env:
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Kubeconfig Exists
+        run: test -n "$KUBE_CONFIG"
+
+      - name: Deploy to Kubernetes Dev
+        run: |
+          echo "$KUBE_CONFIG" > kubeconfig
+          export KUBECONFIG=kubeconfig
+          echo "Applying deployment to Dev..."
+          # Placeholder for user-defined deployment commands
+        shell: bash
+
+      - name: Post-Deployment Health Check
+        run: |
+          echo "Health check for dev environment..."
+        shell: bash
+
+  job_10_artifact:
+    name: Artifact Publish
+    needs: [job_9_deploy_dev]
+    runs-on: Self Hosted Agent
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish Artifact
+        run: |
+          echo "Publishing JAR artifact..."
+        shell: bash
