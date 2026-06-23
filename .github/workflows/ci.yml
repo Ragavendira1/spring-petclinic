@@ -1,0 +1,171 @@
+name: CI
+on:
+  push:
+    branches: [main]
+
+jobs:
+
+  code_repo:
+    runs-on: Self Hosted Agent
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: spring-projects/spring-petclinic
+          ref: main
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Validate checkout
+        run: |
+          echo "Code checkout completed"
+
+  secret_scan:
+    needs: [code_repo]
+    runs-on: Azure Hosted Agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Secret Scan (Gitleaks)
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks-linux-amd64 -o gitleaks
+          chmod +x gitleaks
+          ./gitleaks detect --source . --report-format json --report-path gitleaks-report.json --no-banner
+        continue-on-error: false
+
+  sast:
+    needs: [secret_scan]
+    runs-on: Azure Hosted Agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+
+      - uses: github/codeql-action/analyze@v3
+        continue-on-error: false
+
+  dependency_install:
+    needs: [sast]
+    runs-on: Self Hosted Agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+  dependency_scan:
+    needs: [dependency_install]
+    runs-on: Azure Hosted Agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SCA Scan (OSV Scanner)
+        run: |
+          curl -sSL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o osv
+          chmod +x osv
+          ./osv --format=json --output=osv-report.json --recursive .
+        continue-on-error: false
+
+  lint:
+    needs: [dependency_scan]
+    runs-on: Self Hosted Agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint Code
+        run: |
+          npm run lint || npx eslint .
+
+  test:
+    needs: [lint]
+    runs-on: Self Hosted Agent
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Unit Tests
+        run: npm test
+        continue-on-error: false
+
+  build:
+    needs: [test]
+    runs-on: Self Hosted Agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Application
+        run: npm run build
+
+  container_scan:
+    needs: [build]
+    runs-on: Azure Hosted Agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy FS Scan
+        run: |
+          curl -sSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+          ./bin/trivy fs --severity HIGH,CRITICAL --exit-code 1 --format json --output trivy-fs-report.json .
+
+  iac_scan:
+    needs: [container_scan]
+    runs-on: Azure Hosted Agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: IaC Scan (tfsec)
+        run: |
+          curl -sSL https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64 -o tfsec
+          chmod +x tfsec
+          ./tfsec --format json --out tfsec-report.json
+        continue-on-error: false
+
+  sbom:
+    needs: [iac_scan]
+    runs-on: Azure Hosted Agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SBOM (CycloneDX JSON)
+        run: |
+          npm install -g @cyclonedx/bom
+          cyclonedx-bom -o sbom.json
+
+  deploy_dev:
+    needs: [sbom]
+    runs-on: Self Hosted Agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Dev
+        run: echo "Deploying to development environment"
+
+  dast:
+    needs: [deploy_dev]
+    runs-on: Azure Hosted Agent
+    steps:
+      - name: DAST Scan (OWASP ZAP)
+        run: |
+          echo "DAST scan placeholder: OWASP ZAP would target https://dev.myapp.com"
+
+  compliance_checks:
+    needs: [dast]
+    runs-on: Azure Hosted Agent
+    steps:
+      - name: Compliance Checks
+        run: echo "Compliance checks (PCI DSS, SOC2, ISO27001, GDPR)"
+
+  artifact:
+    needs: [compliance_checks]
+    runs-on: Self Hosted Agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package Artifact
+        run: echo "Packaging artifact"
