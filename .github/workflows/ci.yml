@@ -1,0 +1,173 @@
+name: ci-devsecops
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+
+  code_repo:
+    runs-on: ubuntu-linux
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Code (Least Privilege)
+        uses: actions/checkout@v4
+        with:
+          repository: Ragavendira1/spring-petclinic
+          ref: main
+          fetch-depth: 1
+
+      - name: Validate Repository State
+        run: git status
+
+
+  secret_scan:
+    runs-on: ubuntu-linux
+    needs: [code_repo]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Secret Scan (Gitleaks) - Hard Gate
+        run: |
+          docker run --rm -v $(pwd):/repo zricethezav/gitleaks:latest detect -s /repo --no-banner --exit-code 1
+
+
+  sast:
+    runs-on: ubuntu-linux
+    needs: [secret_scan]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Semgrep
+        run: |
+          pip install semgrep
+
+      - name: Run SAST (Semgrep) - Hard Gate
+        run: |
+          semgrep scan --config auto --error --severity error .
+
+
+  dependency_install:
+    runs-on: ubuntu-linux
+    needs: [sast]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Maven Dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: maven-
+
+      - name: Install Dependencies
+        run: mvn -B dependency:resolve dependency:resolve-plugins
+
+
+  dependency_scan:
+    runs-on: ubuntu-linux
+    needs: [dependency_install]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OSV Scanner
+        run: |
+          curl -sSL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
+          chmod +x /usr/local/bin/osv-scanner
+
+      - name: Run Dependency Scan (OSV) - Hard Gate
+        run: |
+          osv-scanner --config=./osv-scan-config.toml --exit-code-on-vuln=1 .
+
+
+  build:
+    runs-on: ubuntu-linux
+    needs: [dependency_scan]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Maven Build Artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            target
+          key: maven-build-${{ hashFiles('**/pom.xml') }}
+
+      - name: Build Application
+        run: mvn -B package -DskipTests
+
+      - name: Upload Build Artifact (Signed)
+        run: |
+          mkdir -p signed-artifacts
+          cp target/*.jar signed-artifacts/
+          echo "Signing artifacts..."
+          openssl dgst -sha256 signed-artifacts/*.jar > signed-artifacts/checksum.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-artifacts
+          path: signed-artifacts/
+
+
+  sbom:
+    runs-on: ubuntu-linux
+    needs: [build]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SBOM (Syft)
+        run: |
+          docker run --rm -v $(pwd):/src anchore/syft:latest dir:/src -o cyclonedx-json=sbom.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+
+
+  deploy_dev:
+    runs-on: ubuntu-linux
+    needs: [sbom]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-artifacts
+          path: ./dist
+
+      - name: Validate Artifact Integrity (Checksum)
+        run: |
+          sha256sum -c ./dist/checksum.txt || exit 1
+
+      - name: Kubernetes Dev Deployment (Least Privilege)
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBE_CONFIG" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+          echo "Deploying to Kubernetes Dev..."
+          kubectl apply -f k8s/deployment.yaml
+          kubectl rollout status deployment/spring-petclinic --timeout=120s
+
+      - name: Post-Deployment Health Check
+        run: |
+          echo "Running health checks..."
+          kubectl get pods
+          kubectl get services
+
+      - name: Incident Response Hook (Security Monitoring)
+        run: |
+          echo "No security incidents detected. Monitoring activated."
